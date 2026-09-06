@@ -1,0 +1,1819 @@
+--[[
+    Cart Hub
+    Self-contained Roblox LocalScript for StarterPlayerScripts.
+    Place in StarterPlayer > StarterPlayerScripts.
+--]]
+
+local CONFIG = {
+    ToggleKey = Enum.KeyCode.RightShift,
+
+    AccentColor = Color3.fromRGB(0, 170, 255),
+    RidingColor = Color3.fromRGB(255, 170, 0),
+    IdleColor = Color3.fromRGB(0, 255, 255),
+    AllCartsColor = Color3.fromRGB(170, 90, 255),
+    LockActiveColor = Color3.fromRGB(255, 60, 60),
+    DangerColor = Color3.fromRGB(255, 80, 80),
+    SuccessColor = Color3.fromRGB(80, 255, 140),
+
+    GuiSize = Vector2.new(420, 580),
+    TitleBarHeight = 40,
+    RefreshInterval = 0.75,
+    RegistryScanInterval = 2,
+    LockScanInterval = 0.1,
+
+    FellOffMapY = -60,
+    OrbitSpeed = 1.2,
+    ViewerSize = 220,
+
+    LockGuardDuration = 0.35,
+    LockCounterDebounce = 0.4,
+    LockStepThreshold = 0.15,
+    LockMoveStateThreshold = 0.12,
+    LockMoveStateHold = 0.35,
+
+    RowHeight = 42,
+    SeatRowHeight = 32,
+    ButtonHeight = 34,
+}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local Camera = Workspace.CurrentCamera or Workspace:WaitForChild("Camera")
+local Mouse = LocalPlayer:GetMouse()
+
+local Gui = {}
+local Registry = {} -- [Model] = cartInfo
+local FocusedCart = nil
+local AllCartsMode = false
+local AllCartsLockActive = false
+local EspEnabled = false
+local IsOpen = true
+local IsExpanded = false
+local SelectingCart = false
+local SelectionConnection = nil
+
+local Dragging = false
+local DragStartPos = nil
+local FrameStartPos = nil
+
+local SpamUpActive = false
+local SpamDownActive = false
+
+local Connections = {}
+
+-- Utility
+function cleanConnection(con)
+    if con then
+        pcall(function() con:Disconnect() end)
+    end
+end
+
+function clearConnections(list)
+    for _, con in ipairs(list) do
+        cleanConnection(con)
+    end
+    table.clear(list)
+end
+
+function isInWorkspace(obj)
+    return obj and obj:IsDescendantOf(Workspace)
+end
+
+function getCharacter()
+    return LocalPlayer.Character
+end
+
+function getHumanoid()
+    local char = getCharacter()
+    if char then
+        return char:FindFirstChildOfClass("Humanoid")
+    end
+    return nil
+end
+
+function getTopModel(part)
+    local current = part
+    local topModel = nil
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            topModel = current
+        end
+        current = current.Parent
+    end
+    return topModel
+end
+
+function getModelPrimaryPart(model)
+    if model.PrimaryPart then
+        return model.PrimaryPart
+    end
+    local best = nil
+    local bestVol = -1
+    for _, desc in ipairs(model:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            local vol = desc.Size.X * desc.Size.Y * desc.Size.Z
+            if vol > bestVol then
+                bestVol = vol
+                best = desc
+            end
+        end
+    end
+    return best
+end
+
+function getCartForward(cartInfo)
+    local primary = cartInfo.PrimaryPart
+    if primary then
+        return primary.CFrame.LookVector
+    end
+    return cartInfo.Model:GetPivot().LookVector
+end
+
+function playTween(object, properties, duration, easingStyle, easingDirection)
+    local tween = TweenService:Create(object, TweenInfo.new(duration or 0.15, easingStyle or Enum.EasingStyle.Quad, easingDirection or Enum.EasingDirection.Out), properties)
+    tween:Play()
+    return tween
+end
+
+function styleButton(btn, accent)
+    accent = accent or CONFIG.AccentColor
+    btn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    btn.BorderSizePixel = 0
+    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.AutoButtonColor = false
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = btn
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = accent
+    stroke.Thickness = 1
+    stroke.Transparency = 0.7
+    stroke.Parent = btn
+
+    local originalColor = btn.BackgroundColor3
+    local hoverColor = Color3.fromRGB(55, 55, 55)
+
+    btn.MouseEnter:Connect(function()
+        playTween(btn, {BackgroundColor3 = hoverColor}, 0.12)
+        playTween(stroke, {Transparency = 0.3}, 0.12)
+    end)
+    btn.MouseLeave:Connect(function()
+        playTween(btn, {BackgroundColor3 = originalColor}, 0.12)
+        playTween(stroke, {Transparency = 0.7}, 0.12)
+    end)
+    btn.MouseButton1Down:Connect(function()
+        playTween(btn, {Size = UDim2.new(btn.Size.X.Scale, btn.Size.X.Offset * 0.95, btn.Size.Y.Scale, btn.Size.Y.Offset * 0.95)}, 0.08)
+    end)
+    btn.MouseButton1Up:Connect(function()
+        playTween(btn, {Size = UDim2.new(btn.Size.X.Scale, btn.Size.X.Offset / 0.95, btn.Size.Y.Scale, btn.Size.Y.Offset / 0.95)}, 0.08)
+    end)
+end
+
+function createToggleSwitch(parent, text, initialValue, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -20, 0, 38)
+    frame.Position = UDim2.new(0, 10, 0, 0)
+    frame.BackgroundTransparency = 1
+    frame.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.6, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    label.Font = Enum.Font.Gotham
+    label.TextSize = 14
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local switch = Instance.new("TextButton")
+    switch.Size = UDim2.new(0, 48, 0, 24)
+    switch.Position = UDim2.new(1, -48, 0.5, -12)
+    switch.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    switch.BorderSizePixel = 0
+    switch.Text = ""
+    switch.AutoButtonColor = false
+    switch.Parent = frame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = switch
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 18, 0, 18)
+    knob.Position = UDim2.new(0, 3, 0.5, -9)
+    knob.BackgroundColor3 = Color3.fromRGB(230, 230, 230)
+    knob.BorderSizePixel = 0
+    knob.Parent = switch
+
+    local knobCorner = Instance.new("UICorner")
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    knobCorner.Parent = knob
+
+    local on = initialValue
+    local function update()
+        if on then
+            playTween(switch, {BackgroundColor3 = CONFIG.AccentColor}, 0.15)
+            playTween(knob, {Position = UDim2.new(1, -21, 0.5, -9)}, 0.15)
+        else
+            playTween(switch, {BackgroundColor3 = Color3.fromRGB(60, 60, 60)}, 0.15)
+            playTween(knob, {Position = UDim2.new(0, 3, 0.5, -9)}, 0.15)
+        end
+        callback(on)
+    end
+
+    switch.MouseButton1Click:Connect(function()
+        on = not on
+        update()
+    end)
+
+    if on then update() end
+    return frame
+end
+
+-- Registry & detection
+function getButtonName(part)
+    local name = string.lower(part.Name)
+    if name == "up" then
+        return "Up"
+    elseif name == "down" then
+        return "Down"
+    elseif name == "start" or name == "on" then
+        return "Toggle"
+    end
+    return nil
+end
+
+function findClickDetector(part)
+    local cd = part:FindFirstChildOfClass("ClickDetector") or part:FindFirstChildWhichIsA("ClickDetector", true)
+    if cd then return cd end
+
+    local parent = part.Parent
+    if parent then
+        cd = parent:FindFirstChildOfClass("ClickDetector")
+        if cd then return cd end
+        for _, sibling in ipairs(parent:GetChildren()) do
+            if sibling:IsA("ClickDetector") then
+                return sibling
+            end
+        end
+    end
+
+    return nil
+end
+
+function createCartInfo(model)
+    return {
+        Model = model,
+        Buttons = {},
+        Seats = {},
+        PrimaryPart = nil,
+        Esp = {},
+        ButtonColors = {},
+        ButtonConnections = {},
+        Guard = {},
+        LastCounter = {},
+        LastPosition = nil,
+        IsMoving = false,
+        MoveStateTimer = 0,
+        LockActive = false,
+        LockedToggleRed = nil,
+        ToggleArmed = true,
+        ViewerClone = nil,
+    }
+end
+
+function scanModelForParts(cartInfo)
+    local model = cartInfo.Model
+    cartInfo.Buttons = {}
+    cartInfo.Seats = {}
+
+    for _, desc in ipairs(model:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            local role = getButtonName(desc)
+            if role then
+                local cd = findClickDetector(desc)
+                if cd then
+                    if role == "Toggle" then
+                        if not cartInfo.Buttons.Toggle or string.lower(desc.Name) == "start" then
+                            cartInfo.Buttons.Toggle = cd
+                        end
+                    else
+                        cartInfo.Buttons[role] = cd
+                    end
+                    cartInfo.ButtonColors[cd] = desc.Color
+                end
+            end
+            if desc:IsA("Seat") or desc:IsA("VehicleSeat") then
+                table.insert(cartInfo.Seats, desc)
+            end
+        end
+    end
+
+    cartInfo.PrimaryPart = getModelPrimaryPart(model)
+end
+
+function registerCart(model)
+    if Registry[model] then
+        return Registry[model]
+    end
+    local info = createCartInfo(model)
+    Registry[model] = info
+    scanModelForParts(info)
+    if AllCartsMode and AllCartsLockActive and not info.LockActive then
+        toggleLock(info, true)
+    end
+    return info
+end
+
+function unregisterCart(model)
+    local info = Registry[model]
+    if not info then return end
+
+    if FocusedCart == info then
+        unfocusCart()
+    end
+
+    clearConnections(info.ButtonConnections)
+
+    if info.Esp.Highlight then info.Esp.Highlight:Destroy() end
+    if info.Esp.Nameplate then info.Esp.Nameplate:Destroy() end
+
+    Registry[model] = nil
+end
+
+function scanWorkspace()
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            local role = getButtonName(desc)
+            if role and findClickDetector(desc) then
+                local model = getTopModel(desc)
+                if model then
+                    registerCart(model)
+                end
+            end
+        end
+    end
+
+    for model, info in pairs(Registry) do
+        if not isInWorkspace(model) then
+            unregisterCart(model)
+        end
+    end
+end
+
+-- ESP
+function ensureEsp(cartInfo)
+    local model = cartInfo.Model
+    if not isInWorkspace(model) then return end
+
+    if not cartInfo.Esp.Highlight then
+        local hl = Instance.new("Highlight")
+        hl.Name = "CartHubHighlight"
+        hl.Adornee = model
+        hl.FillTransparency = 0.75
+        hl.OutlineTransparency = 0.1
+        hl.OutlineColor = CONFIG.IdleColor
+        hl.FillColor = CONFIG.IdleColor
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.Parent = model
+        cartInfo.Esp.Highlight = hl
+    end
+
+    if not cartInfo.Esp.Nameplate then
+        local primary = cartInfo.PrimaryPart
+        if not primary then return end
+        local bg = Instance.new("BillboardGui")
+        bg.Name = "CartHubNameplate"
+        bg.Adornee = primary
+        bg.Size = UDim2.new(0, 160, 0, 44)
+        bg.StudsOffset = Vector3.new(0, 8, 0)
+        bg.AlwaysOnTop = true
+        bg.Parent = primary
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 1, 0)
+        frame.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+        frame.BackgroundTransparency = 0.25
+        frame.BorderSizePixel = 0
+        frame.Parent = bg
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = frame
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = CONFIG.AccentColor
+        stroke.Thickness = 1
+        stroke.Transparency = 0.5
+        stroke.Parent = frame
+
+        local label = Instance.new("TextLabel")
+        label.Name = "NameLabel"
+        label.Size = UDim2.new(1, -8, 0.5, -2)
+        label.Position = UDim2.new(0, 4, 0, 2)
+        label.BackgroundTransparency = 1
+        label.Text = model.Name
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 12
+        label.TextWrapped = true
+        label.Parent = frame
+
+        local sub = Instance.new("TextLabel")
+        sub.Name = "SubLabel"
+        sub.Size = UDim2.new(1, -8, 0.5, -2)
+        sub.Position = UDim2.new(0, 4, 0.5, 0)
+        sub.BackgroundTransparency = 1
+        sub.Text = "IDLE"
+        sub.TextColor3 = CONFIG.IdleColor
+        sub.Font = Enum.Font.Gotham
+        sub.TextSize = 11
+        sub.Parent = frame
+
+        cartInfo.Esp.Nameplate = bg
+        cartInfo.Esp.NameplateLabel = label
+        cartInfo.Esp.NameplateSub = sub
+    end
+end
+
+function updateEsp()
+    for _, info in pairs(Registry) do
+        if EspEnabled then
+            ensureEsp(info)
+        else
+            if info.Esp.Highlight then
+                info.Esp.Highlight:Destroy()
+                info.Esp.Highlight = nil
+            end
+            if info.Esp.Nameplate then
+                info.Esp.Nameplate:Destroy()
+                info.Esp.Nameplate = nil
+            end
+        end
+    end
+end
+
+function setEspRidden(info, riderName)
+    if info.Esp.Highlight then
+        info.Esp.Highlight.OutlineColor = CONFIG.RidingColor
+        info.Esp.Highlight.FillColor = CONFIG.RidingColor
+    end
+    if info.Esp.NameplateSub then
+        info.Esp.NameplateSub.Text = riderName and ("RIDING · " .. riderName) or "RIDING"
+        info.Esp.NameplateSub.TextColor3 = CONFIG.RidingColor
+    end
+end
+
+function setEspIdle(info)
+    if info.Esp.Highlight then
+        info.Esp.Highlight.OutlineColor = CONFIG.IdleColor
+        info.Esp.Highlight.FillColor = CONFIG.IdleColor
+    end
+    if info.Esp.NameplateSub then
+        info.Esp.NameplateSub.Text = "IDLE"
+        info.Esp.NameplateSub.TextColor3 = CONFIG.IdleColor
+    end
+end
+
+-- Cart state helpers
+function getCartRiderInfo(cartInfo)
+    for _, seat in ipairs(cartInfo.Seats) do
+        local occupant = seat.Occupant
+        if occupant then
+            local char = occupant.Parent
+            local player = Players:GetPlayerFromCharacter(char)
+            return true, player and player.Name or char.Name
+        end
+    end
+    return false, nil
+end
+
+-- Viewer clone
+function buildViewerClone(cartInfo)
+    if cartInfo.ViewerClone then
+        cartInfo.ViewerClone:Destroy()
+    end
+
+    local clone = cartInfo.Model:Clone()
+    if not clone then return end
+    clone.Name = "CartHubViewerClone"
+
+    for _, desc in ipairs(clone:GetDescendants()) do
+        if desc:IsA("Script") or desc:IsA("LocalScript") or desc:IsA("ModuleScript") or desc:IsA("ClickDetector") then
+            desc:Destroy()
+        elseif desc:IsA("BasePart") then
+            desc.Anchored = true
+            desc.CanCollide = false
+            desc.CanQuery = false
+            desc.CanTouch = false
+        end
+    end
+
+    local cf, size = clone:GetBoundingBox()
+    local center = cf.Position
+    for _, part in ipairs(clone:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CFrame = part.CFrame - center
+        end
+    end
+
+    clone.Parent = Gui.ViewerFrame
+    cartInfo.ViewerClone = clone
+end
+
+-- Controls
+function isRedColor(color)
+    local r, g, b = color.R * 255, color.G * 255, color.B * 255
+    -- broad red detection: red dominant and green/blue low
+    return r > 150 and g < 120 and b < 120 and r > g + 30 and r > b + 30
+end
+
+function getCartSpeed(cartInfo)
+    local model = cartInfo.Model
+    local candidates = { "Speed", "speed", "CurrentSpeed", "currentSpeed", "CartSpeed" }
+    for _, name in ipairs(candidates) do
+        local val = model:FindFirstChild(name)
+        if val and (val:IsA("IntValue") or val:IsA("NumberValue")) then
+            return val.Value
+        end
+    end
+    for _, child in ipairs(model:GetDescendants()) do
+        if table.find(candidates, child.Name) and (child:IsA("IntValue") or child:IsA("NumberValue")) then
+            return child.Value
+        end
+    end
+    return nil
+end
+
+function fireButton(cd)
+    if not cd then return end
+
+    if typeof(fireclickdetector) == "function" then
+        pcall(function()
+            fireclickdetector(cd, 0, "MouseClick")
+        end)
+        return
+    end
+
+    pcall(function()
+        local original = cd.MaxActivationDistance
+        cd.MaxActivationDistance = 10000
+        cd:Fire(LocalPlayer)
+        task.delay(0.05, function()
+            pcall(function() cd.MaxActivationDistance = original end)
+        end)
+    end)
+end
+
+function guiPressButton(cartInfo, role)
+    local cd = cartInfo.Buttons[role]
+    if not cd then return end
+    cartInfo.Guard[cd] = tick() + CONFIG.LockGuardDuration
+    fireButton(cd)
+end
+
+function updateLockButtonVisual()
+    local active = false
+    if AllCartsMode then
+        active = AllCartsLockActive
+    elseif FocusedCart then
+        active = FocusedCart.LockActive
+    end
+
+    local targetColor = active and CONFIG.LockActiveColor or Color3.fromRGB(40, 40, 40)
+    local strokeColor = active and CONFIG.LockActiveColor or CONFIG.AccentColor
+    local stroke = Gui.LockBtn:FindFirstChildOfClass("UIStroke")
+    Gui.LockBtn.BackgroundColor3 = targetColor
+    if stroke then
+        stroke.Color = strokeColor
+    end
+end
+
+function toggleLock(cartInfo, forceState)
+    local newState = forceState ~= nil and forceState or not cartInfo.LockActive
+    cartInfo.LockActive = newState
+
+    if newState then
+        clearConnections(cartInfo.ButtonConnections)
+
+        -- Remember target state to defend
+        cartInfo.LockedSpeed = getCartSpeed(cartInfo)
+
+        local toggleCd = cartInfo.Buttons.Toggle
+        if toggleCd then
+            local togglePart = toggleCd.Parent
+            if togglePart and togglePart:IsA("BasePart") then
+                cartInfo.LockedToggleRed = isRedColor(togglePart.Color)
+                cartInfo.ToggleArmed = true
+            end
+        end
+
+        -- Only use color-based counteract when no Speed value is available
+        if cartInfo.LockedSpeed == nil then
+            for role, cd in pairs(cartInfo.Buttons) do
+                if role == "Toggle" then continue end
+                local part = cd.Parent
+                if part and part:IsA("BasePart") then
+                    cartInfo.ButtonColors[cd] = part.Color
+
+                    local function counteract()
+                        if not cartInfo.LockActive then return end
+                        if tick() < (cartInfo.Guard[cd] or 0) then return end
+                        if tick() < (cartInfo.LastCounter[role] or 0) then return end
+
+                        cartInfo.LastCounter[role] = tick() + CONFIG.LockCounterDebounce
+                        if role == "Up" then
+                            guiPressButton(cartInfo, "Down")
+                        elseif role == "Down" then
+                            guiPressButton(cartInfo, "Up")
+                        end
+                    end
+
+                    table.insert(cartInfo.ButtonConnections, part:GetPropertyChangedSignal("Color"):Connect(function()
+                        if not cartInfo.LockActive then return end
+                        if tick() < (cartInfo.Guard[cd] or 0) then return end
+                        if tick() < (cartInfo.LastCounter[role] or 0) then return end
+
+                        local delta = (part.Color - (cartInfo.ButtonColors[cd] or part.Color)).Magnitude
+                        if delta > 0.001 then
+                            counteract()
+                        end
+                    end))
+
+                    table.insert(cartInfo.ButtonConnections, part:GetPropertyChangedSignal("BrickColor"):Connect(function()
+                        if not cartInfo.LockActive then return end
+                        if tick() < (cartInfo.Guard[cd] or 0) then return end
+                        if tick() < (cartInfo.LastCounter[role] or 0) then return end
+                        counteract()
+                    end))
+                end
+            end
+        end
+
+        for role, _ in pairs(cartInfo.Buttons) do
+            cartInfo.LastCounter[role] = tick() + CONFIG.LockCounterDebounce
+        end
+    else
+        clearConnections(cartInfo.ButtonConnections)
+        cartInfo.LockedToggleRed = nil
+        cartInfo.ToggleArmed = true
+        cartInfo.LockedSpeed = nil
+    end
+end
+
+function pressButtonOnAll(role)
+    for _, info in pairs(Registry) do
+        guiPressButton(info, role)
+    end
+end
+
+function stopAllSpam()
+    SpamUpActive = false
+    SpamDownActive = false
+    if Gui.SpamUpBtn then
+        Gui.SpamUpBtn.BackgroundColor3 = CONFIG.SuccessColor
+    end
+    if Gui.SpamDownBtn then
+        Gui.SpamDownBtn.BackgroundColor3 = CONFIG.SuccessColor
+    end
+end
+
+-- Focus / spectate
+function focusCart(cartInfo)
+    if FocusedCart == cartInfo and not AllCartsMode then return end
+    if not isInWorkspace(cartInfo.Model) then return end
+
+    stopAllSpam()
+    unfocusCart()
+
+    AllCartsMode = false
+    FocusedCart = cartInfo
+    Gui.FocusName.Text = "Spectating: " .. cartInfo.Model.Name
+    Gui.ControlPanel.Visible = true
+    Gui.ViewerFrame.Visible = true
+
+    local primary = cartInfo.PrimaryPart
+    if primary then
+        Camera.CameraType = Enum.CameraType.Custom
+        Camera.CameraSubject = primary
+    end
+
+    buildViewerClone(cartInfo)
+    refreshCartList()
+end
+
+function focusAllCarts()
+    if AllCartsMode then return end
+
+    stopAllSpam()
+    unfocusCart()
+
+    AllCartsMode = true
+    FocusedCart = nil
+    Gui.FocusName.Text = "Controlling: ALL CARTS"
+    Gui.ControlPanel.Visible = true
+    Gui.ViewerFrame.Visible = false
+
+    local humanoid = getHumanoid()
+    if humanoid then
+        Camera.CameraSubject = humanoid
+    end
+    Camera.CameraType = Enum.CameraType.Custom
+
+    if AllCartsLockActive then
+        for _, info in pairs(Registry) do
+            if not info.LockActive then
+                toggleLock(info, true)
+            end
+        end
+    end
+
+    updateLockButtonVisual()
+    refreshCartList()
+end
+
+function unfocusCart()
+    if not FocusedCart and not AllCartsMode then return end
+
+    stopAllSpam()
+
+    local humanoid = getHumanoid()
+    if humanoid then
+        Camera.CameraSubject = humanoid
+    end
+    Camera.CameraType = Enum.CameraType.Custom
+
+    if FocusedCart and FocusedCart.ViewerClone then
+        FocusedCart.ViewerClone:Destroy()
+        FocusedCart.ViewerClone = nil
+    end
+
+    if FocusedCart and FocusedCart.LockActive then
+        toggleLock(FocusedCart, false)
+    end
+
+    if AllCartsMode and AllCartsLockActive then
+        for _, info in pairs(Registry) do
+            if info.LockActive then
+                toggleLock(info, false)
+            end
+        end
+    end
+
+    FocusedCart = nil
+    AllCartsMode = false
+    Gui.FocusName.Text = "No cart focused"
+    Gui.ControlPanel.Visible = false
+    Gui.ViewerFrame.Visible = true
+
+    updateLockButtonVisual()
+    refreshCartList()
+end
+
+function checkFocusedCart()
+    if not FocusedCart then return end
+    local info = FocusedCart
+    if not isInWorkspace(info.Model) then
+        unfocusCart()
+        return
+    end
+    local primary = info.PrimaryPart
+    if not primary or not primary.Parent then
+        unfocusCart()
+        return
+    end
+    if primary.Position.Y < CONFIG.FellOffMapY then
+        unfocusCart()
+        return
+    end
+end
+
+-- Seat ride
+function rideSeat(seat)
+    local char = getCharacter()
+    if not char then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+
+    if humanoid.Sit or humanoid.SeatPart then
+        humanoid.Sit = false
+        local t = 0
+        while humanoid.SeatPart and t < 1 do
+            t += task.wait(0.05)
+        end
+    end
+
+    local target = seat.CFrame * CFrame.new(0, 1.8, 0)
+    char:PivotTo(target)
+    task.wait(0.05)
+    humanoid.Sit = true
+    pcall(function()
+        if seat:IsA("Seat") or seat:IsA("VehicleSeat") then
+            seat:Sit(humanoid)
+        end
+    end)
+end
+
+-- Mouse-select cart
+function stopCartSelection()
+    if SelectionConnection then
+        cleanConnection(SelectionConnection)
+        SelectionConnection = nil
+    end
+    SelectingCart = false
+    if Gui.SelectBtn then
+        Gui.SelectBtn.Text = "SELECT"
+        playTween(Gui.SelectBtn, {BackgroundColor3 = Color3.fromRGB(40, 40, 40)}, 0.15)
+    end
+    Mouse.Icon = ""
+end
+
+function startCartSelection()
+    if SelectingCart then
+        stopCartSelection()
+        return
+    end
+    SelectingCart = true
+    if Gui.SelectBtn then
+        Gui.SelectBtn.Text = "CLICK A CART"
+        playTween(Gui.SelectBtn, {BackgroundColor3 = CONFIG.AccentColor}, 0.15)
+    end
+    Mouse.Icon = "rbxasset://SystemCursors/Crosshair"
+
+    SelectionConnection = Mouse.Button1Down:Connect(function()
+        local target = Mouse.Target
+        if target then
+            local model = getTopModel(target)
+            if model and Registry[model] then
+                focusCart(Registry[model])
+                stopCartSelection()
+            else
+                -- Allow clicking anywhere else to keep trying until right-click/Esc
+            end
+        end
+    end)
+end
+
+-- GUI list helpers
+local CartRowCache = {}
+local ExpandedSeats = {} -- set of cart models whose seat list is expanded
+
+function clearRows(container, cache)
+    for _, row in ipairs(cache) do
+        row:Destroy()
+    end
+    table.clear(cache)
+end
+
+function buildSeatSubRow(seat, cartInfo)
+    local row = Instance.new("TextButton")
+    row.Size = UDim2.new(1, -30, 0, CONFIG.SeatRowHeight)
+    row.BackgroundColor3 = Color3.fromRGB(36, 36, 42)
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.AutoButtonColor = false
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = row
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -12, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = "  Sit · " .. seat.Name
+    label.TextColor3 = CONFIG.SuccessColor
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+
+    row.MouseEnter:Connect(function()
+        playTween(row, {BackgroundColor3 = Color3.fromRGB(48, 48, 56)}, 0.12)
+    end)
+    row.MouseLeave:Connect(function()
+        playTween(row, {BackgroundColor3 = Color3.fromRGB(36, 36, 42)}, 0.12)
+    end)
+
+    row.MouseButton1Click:Connect(function()
+        rideSeat(seat)
+    end)
+
+    return row
+end
+
+function buildAllCartsRow()
+    local row = Instance.new("TextButton")
+    row.Name = "CartRow_All"
+    row.Size = UDim2.new(1, -4, 0, CONFIG.RowHeight)
+    row.BackgroundColor3 = Color3.fromRGB(40, 32, 55)
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.LayoutOrder = -1
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = row
+
+    local strip = Instance.new("Frame")
+    strip.Size = UDim2.new(0, 4, 0.6, 0)
+    strip.Position = UDim2.new(0, 8, 0.2, 0)
+    strip.BackgroundColor3 = CONFIG.AllCartsColor
+    strip.BorderSizePixel = 0
+    strip.Parent = row
+    local stripCorner = Instance.new("UICorner")
+    stripCorner.CornerRadius = UDim.new(1, 0)
+    stripCorner.Parent = strip
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -30, 1, 0)
+    label.Position = UDim2.new(0, 20, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = "ALL CARTS"
+    label.TextColor3 = CONFIG.AllCartsColor
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 14
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+
+    if AllCartsMode then
+        local selStroke = Instance.new("UIStroke")
+        selStroke.Color = CONFIG.AccentColor
+        selStroke.Thickness = 1.5
+        selStroke.Parent = row
+    end
+
+    row.MouseEnter:Connect(function()
+        playTween(row, {BackgroundColor3 = Color3.fromRGB(55, 44, 75)}, 0.12)
+    end)
+    row.MouseLeave:Connect(function()
+        playTween(row, {BackgroundColor3 = Color3.fromRGB(40, 32, 55)}, 0.12)
+    end)
+
+    row.MouseButton1Click:Connect(function()
+        focusAllCarts()
+    end)
+
+    return row
+end
+
+function buildCartRow(cartInfo, index)
+    local model = cartInfo.Model
+    local isRiding, riderName = getCartRiderInfo(cartInfo)
+
+    local container = Instance.new("Frame")
+    container.Name = "CartContainer_" .. tostring(index)
+    container.Size = UDim2.new(1, -4, 0, CONFIG.RowHeight)
+    container.BackgroundTransparency = 1
+    container.BorderSizePixel = 0
+    container.LayoutOrder = isRiding and 0 or 1000 + index
+
+    local row = Instance.new("TextButton")
+    row.Name = "CartRow_" .. tostring(index)
+    row.Size = UDim2.new(1, 0, 0, CONFIG.RowHeight)
+    row.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.Parent = container
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = row
+
+    local strip = Instance.new("Frame")
+    strip.Size = UDim2.new(0, 4, 0.6, 0)
+    strip.Position = UDim2.new(0, 8, 0.2, 0)
+    strip.BackgroundColor3 = isRiding and CONFIG.RidingColor or CONFIG.IdleColor
+    strip.BorderSizePixel = 0
+    strip.Parent = row
+    local stripCorner = Instance.new("UICorner")
+    stripCorner.CornerRadius = UDim.new(1, 0)
+    stripCorner.Parent = strip
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, -130, 0.55, 0)
+    nameLabel.Position = UDim2.new(0, 20, 0.08, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = model.Name
+    nameLabel.TextColor3 = Color3.fromRGB(240, 240, 240)
+    nameLabel.Font = Enum.Font.GothamSemibold
+    nameLabel.TextSize = 13
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.Parent = row
+
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -130, 0.4, 0)
+    statusLabel.Position = UDim2.new(0, 20, 0.55, 0)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = isRiding and ("RIDING · " .. riderName) or "IDLE"
+    statusLabel.TextColor3 = isRiding and CONFIG.RidingColor or Color3.fromRGB(160, 160, 160)
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextSize = 11
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Parent = row
+
+    if FocusedCart == cartInfo then
+        local selStroke = Instance.new("UIStroke")
+        selStroke.Color = CONFIG.AccentColor
+        selStroke.Thickness = 1.5
+        selStroke.Parent = row
+    end
+
+    local seatsBtn = Instance.new("TextButton")
+    seatsBtn.Name = "SeatsBtn"
+    seatsBtn.Size = UDim2.new(0, 52, 0, 24)
+    seatsBtn.Position = UDim2.new(1, -58, 0.5, -12)
+    seatsBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+    seatsBtn.BorderSizePixel = 0
+    seatsBtn.Text = "SEATS"
+    seatsBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    seatsBtn.Font = Enum.Font.GothamSemibold
+    seatsBtn.TextSize = 10
+    seatsBtn.AutoButtonColor = false
+    seatsBtn.Parent = row
+    local seatsCorner = Instance.new("UICorner")
+    seatsCorner.CornerRadius = UDim.new(0, 6)
+    seatsCorner.Parent = seatsBtn
+
+    -- Seat sub-list (hidden by default)
+    local seatList = Instance.new("Frame")
+    seatList.Name = "SeatList"
+    seatList.Size = UDim2.new(1, 0, 0, 0)
+    seatList.Position = UDim2.new(0, 0, 0, CONFIG.RowHeight + 4)
+    seatList.BackgroundTransparency = 1
+    seatList.BorderSizePixel = 0
+    seatList.Visible = false
+    seatList.AutomaticSize = Enum.AutomaticSize.Y
+    seatList.Parent = container
+
+    local seatLayout = Instance.new("UIListLayout")
+    seatLayout.Padding = UDim.new(0, 4)
+    seatLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    seatLayout.Parent = seatList
+
+    local seatPadding = Instance.new("UIPadding")
+    seatPadding.PaddingLeft = UDim.new(0, 16)
+    seatPadding.PaddingRight = UDim.new(0, 4)
+    seatPadding.Parent = seatList
+
+    local expanded = false
+    local function refreshSeats()
+        for _, child in ipairs(seatList:GetChildren()) do
+            if child:IsA("TextButton") or child:IsA("TextLabel") then
+                child:Destroy()
+            end
+        end
+
+        local hasFree = false
+        for _, seat in ipairs(cartInfo.Seats) do
+            if seat.Occupant == nil then
+                hasFree = true
+                local seatRow = buildSeatSubRow(seat, cartInfo)
+                seatRow.Parent = seatList
+            end
+        end
+
+        if not hasFree then
+            local none = Instance.new("TextLabel")
+            none.Size = UDim2.new(1, 0, 0, CONFIG.SeatRowHeight)
+            none.BackgroundTransparency = 1
+            none.Text = "  No free seats"
+            none.TextColor3 = Color3.fromRGB(150, 150, 150)
+            none.Font = Enum.Font.Gotham
+            none.TextSize = 11
+            none.TextXAlignment = Enum.TextXAlignment.Left
+            none.Parent = seatList
+        end
+
+        if expanded then
+            local contentSize = seatLayout.AbsoluteContentSize
+            container.Size = UDim2.new(1, -4, 0, CONFIG.RowHeight + 4 + contentSize.Y)
+        end
+    end
+
+    seatsBtn.MouseButton1Click:Connect(function()
+        expanded = not expanded
+        ExpandedSeats[model] = expanded
+        seatList.Visible = expanded
+        if expanded then
+            refreshSeats()
+            seatsBtn.BackgroundColor3 = CONFIG.AccentColor
+            seatsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            seatsBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+            seatsBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+            container.Size = UDim2.new(1, -4, 0, CONFIG.RowHeight)
+        end
+    end)
+
+    if ExpandedSeats[model] then
+        expanded = true
+        seatList.Visible = true
+        refreshSeats()
+        seatsBtn.BackgroundColor3 = CONFIG.AccentColor
+        seatsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    end
+
+    row.MouseEnter:Connect(function()
+        playTween(row, {BackgroundColor3 = Color3.fromRGB(42, 42, 50)}, 0.12)
+    end)
+    row.MouseLeave:Connect(function()
+        playTween(row, {BackgroundColor3 = Color3.fromRGB(32, 32, 38)}, 0.12)
+    end)
+
+    row.MouseButton1Click:Connect(function()
+        focusCart(cartInfo)
+    end)
+
+    return container, isRiding, riderName
+end
+
+function refreshCartList()
+    local list = {}
+    for _, info in pairs(Registry) do
+        table.insert(list, info)
+    end
+
+    table.sort(list, function(a, b)
+        local aRiding, aRider = getCartRiderInfo(a)
+        local bRiding, bRider = getCartRiderInfo(b)
+        if aRiding and not bRiding then return true end
+        if not aRiding and bRiding then return false end
+        local aKey = aRider or a.Model.Name
+        local bKey = bRider or b.Model.Name
+        return string.lower(aKey) < string.lower(bKey)
+    end)
+
+    clearRows(Gui.CartsPage, CartRowCache)
+
+    local allRow = buildAllCartsRow()
+    allRow.Parent = Gui.CartsPage
+    table.insert(CartRowCache, allRow)
+
+    local ridingCount = 0
+    for idx, info in ipairs(list) do
+        local isRiding, riderName = getCartRiderInfo(info)
+        if isRiding then ridingCount += 1 end
+        local row, _, _ = buildCartRow(info, idx)
+        row.Parent = Gui.CartsPage
+        table.insert(CartRowCache, row)
+    end
+
+    Gui.StatusLabel.Text = string.format("Carts: %d   •   Riding: %d", #list, ridingCount)
+    Gui.PulseDot.BackgroundColor3 = ridingCount > 0 and CONFIG.RidingColor or CONFIG.IdleColor
+end
+
+-- GUI construction
+function buildGui()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "CartHub"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = PlayerGui
+
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Name = "MainFrame"
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    mainFrame.Size = UDim2.new(0, CONFIG.GuiSize.X, 0, CONFIG.TitleBarHeight)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 26)
+    mainFrame.BackgroundTransparency = 0.08
+    mainFrame.BorderSizePixel = 0
+    mainFrame.ClipsDescendants = true
+    mainFrame.Parent = screenGui
+
+    local uiScale = Instance.new("UIScale")
+    uiScale.Parent = mainFrame
+    if UserInputService.TouchEnabled then
+        uiScale.Scale = 0.72
+    end
+
+    local gradient = Instance.new("UIGradient")
+    gradient.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(28, 28, 34)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 16, 20))
+    }
+    gradient.Rotation = 90
+    gradient.Parent = mainFrame
+
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 16)
+    mainCorner.Parent = mainFrame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = CONFIG.AccentColor
+    stroke.Thickness = 1.2
+    stroke.Transparency = 0.35
+    stroke.Parent = mainFrame
+
+    local titleBar = Instance.new("Frame")
+    titleBar.Name = "TitleBar"
+    titleBar.Size = UDim2.new(1, 0, 0, CONFIG.TitleBarHeight)
+    titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = mainFrame
+
+    local titleCorner = Instance.new("UICorner")
+    titleCorner.CornerRadius = UDim.new(0, 16)
+    titleCorner.Parent = titleBar
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -150, 1, 0)
+    titleLabel.Position = UDim2.new(0, 16, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = "Cart Hub"
+    titleLabel.TextColor3 = Color3.fromRGB(240, 240, 240)
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 17
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = titleBar
+
+    local accentLine = Instance.new("Frame")
+    accentLine.Size = UDim2.new(0, 4, 0, 18)
+    accentLine.Position = UDim2.new(0, 8, 0.5, -9)
+    accentLine.BackgroundColor3 = CONFIG.AccentColor
+    accentLine.BorderSizePixel = 0
+    accentLine.Parent = titleBar
+    local accentLineCorner = Instance.new("UICorner")
+    accentLineCorner.CornerRadius = UDim.new(1, 0)
+    accentLineCorner.Parent = accentLine
+
+    local selectBtn = Instance.new("TextButton")
+    selectBtn.Name = "Select"
+    selectBtn.Size = UDim2.new(0, 60, 0, 24)
+    selectBtn.Position = UDim2.new(1, -128, 0, 8)
+    selectBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    selectBtn.BorderSizePixel = 0
+    selectBtn.Text = "SELECT"
+    selectBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    selectBtn.Font = Enum.Font.GothamBold
+    selectBtn.TextSize = 10
+    selectBtn.AutoButtonColor = false
+    selectBtn.Parent = titleBar
+    local selectCorner = Instance.new("UICorner")
+    selectCorner.CornerRadius = UDim.new(0, 6)
+    selectCorner.Parent = selectBtn
+    local selectStroke = Instance.new("UIStroke")
+    selectStroke.Color = CONFIG.AccentColor
+    selectStroke.Thickness = 1
+    selectStroke.Transparency = 0.6
+    selectStroke.Parent = selectBtn
+
+    selectBtn.MouseEnter:Connect(function()
+        playTween(selectBtn, {BackgroundColor3 = Color3.fromRGB(55, 55, 55)}, 0.12)
+    end)
+    selectBtn.MouseLeave:Connect(function()
+        playTween(selectBtn, {BackgroundColor3 = Color3.fromRGB(40, 40, 40)}, 0.12)
+    end)
+    selectBtn.MouseButton1Click:Connect(function()
+        startCartSelection()
+    end)
+
+    local minimizeBtn = Instance.new("TextButton")
+    minimizeBtn.Name = "Minimize"
+    minimizeBtn.Size = UDim2.new(0, 28, 0, 28)
+    minimizeBtn.Position = UDim2.new(1, -64, 0, 6)
+    minimizeBtn.BackgroundTransparency = 1
+    minimizeBtn.Text = "+"
+    minimizeBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    minimizeBtn.Font = Enum.Font.GothamBold
+    minimizeBtn.TextSize = 20
+    minimizeBtn.Parent = titleBar
+
+    minimizeBtn.MouseEnter:Connect(function()
+        playTween(minimizeBtn, {TextColor3 = CONFIG.AccentColor}, 0.12)
+    end)
+    minimizeBtn.MouseLeave:Connect(function()
+        playTween(minimizeBtn, {TextColor3 = Color3.fromRGB(220, 220, 220)}, 0.12)
+    end)
+    minimizeBtn.MouseButton1Click:Connect(function()
+        toggleGuiExpanded()
+    end)
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Name = "Close"
+    closeBtn.Size = UDim2.new(0, 30, 0, 30)
+    closeBtn.Position = UDim2.new(1, -36, 0, 5)
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.Text = "×"
+    closeBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 22
+    closeBtn.Parent = titleBar
+
+    closeBtn.MouseEnter:Connect(function()
+        playTween(closeBtn, {TextColor3 = CONFIG.DangerColor}, 0.12)
+    end)
+    closeBtn.MouseLeave:Connect(function()
+        playTween(closeBtn, {TextColor3 = Color3.fromRGB(220, 220, 220)}, 0.12)
+    end)
+    closeBtn.MouseButton1Click:Connect(function()
+        mainFrame.Visible = false
+        IsOpen = false
+    end)
+
+    -- Content frame
+    local contentFrame = Instance.new("Frame")
+    contentFrame.Name = "ContentFrame"
+    contentFrame.Size = UDim2.new(1, 0, 1, -CONFIG.TitleBarHeight)
+    contentFrame.Position = UDim2.new(0, 0, 0, CONFIG.TitleBarHeight)
+    contentFrame.BackgroundTransparency = 1
+    contentFrame.Visible = false
+    contentFrame.Parent = mainFrame
+
+    -- Status card
+    local statusCard = Instance.new("Frame")
+    statusCard.Name = "StatusCard"
+    statusCard.Size = UDim2.new(1, -20, 0, 44)
+    statusCard.Position = UDim2.new(0, 10, 0, 8)
+    statusCard.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    statusCard.BorderSizePixel = 0
+    statusCard.Parent = contentFrame
+
+    local statusCorner = Instance.new("UICorner")
+    statusCorner.CornerRadius = UDim.new(0, 10)
+    statusCorner.Parent = statusCard
+
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Name = "StatusLabel"
+    statusLabel.Size = UDim2.new(1, -50, 1, 0)
+    statusLabel.Position = UDim2.new(0, 40, 0, 0)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = "Carts: 0   •   Riding: 0"
+    statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    statusLabel.Font = Enum.Font.GothamSemibold
+    statusLabel.TextSize = 14
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Parent = statusCard
+
+    local pulseDot = Instance.new("Frame")
+    pulseDot.Name = "PulseDot"
+    pulseDot.Size = UDim2.new(0, 10, 0, 10)
+    pulseDot.Position = UDim2.new(0, 16, 0.5, -5)
+    pulseDot.BackgroundColor3 = CONFIG.IdleColor
+    pulseDot.BorderSizePixel = 0
+    pulseDot.Parent = statusCard
+    local pulseCorner = Instance.new("UICorner")
+    pulseCorner.CornerRadius = UDim.new(1, 0)
+    pulseCorner.Parent = pulseDot
+
+    task.spawn(function()
+        while statusCard.Parent do
+            if pulseDot.BackgroundColor3 == CONFIG.RidingColor then
+                playTween(pulseDot, {Size = UDim2.new(0, 14, 0, 14), Position = UDim2.new(0, 14, 0.5, -7)}, 0.6)
+            end
+            task.wait(0.6)
+            if pulseDot.BackgroundColor3 == CONFIG.RidingColor then
+                playTween(pulseDot, {Size = UDim2.new(0, 10, 0, 10), Position = UDim2.new(0, 16, 0.5, -5)}, 0.6)
+            end
+            task.wait(0.6)
+        end
+    end)
+
+    -- ESP toggle
+    local espToggleFrame = createToggleSwitch(contentFrame, "ESP (see through walls)", false, function(on)
+        EspEnabled = on
+        updateEsp()
+    end)
+    espToggleFrame.Name = "EspToggle"
+    espToggleFrame.Position = UDim2.new(0, 0, 0, 56)
+    espToggleFrame.Parent = contentFrame
+
+    -- Carts list
+    local cartsPage = Instance.new("ScrollingFrame")
+    cartsPage.Name = "CartsPage"
+    cartsPage.Size = UDim2.new(1, 0, 1, -(56 + 38 + 8))
+    cartsPage.Position = UDim2.new(0, 0, 0, 56 + 38)
+    cartsPage.BackgroundTransparency = 1
+    cartsPage.ScrollBarThickness = 4
+    cartsPage.ScrollBarImageColor3 = CONFIG.AccentColor
+    cartsPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    cartsPage.CanvasSize = UDim2.new(0, 0, 0, 0)
+    cartsPage.Parent = contentFrame
+
+    local cartsLayout = Instance.new("UIListLayout")
+    cartsLayout.Padding = UDim.new(0, 6)
+    cartsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    cartsLayout.Parent = cartsPage
+
+    -- Control panel (inside carts page)
+    local controlPanel = Instance.new("Frame")
+    controlPanel.Name = "ControlPanel"
+    controlPanel.Size = UDim2.new(1, 0, 0, 0)
+    controlPanel.AutomaticSize = Enum.AutomaticSize.Y
+    controlPanel.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    controlPanel.BorderSizePixel = 0
+    controlPanel.Visible = false
+    controlPanel.LayoutOrder = 999999
+    controlPanel.Parent = cartsPage
+
+    local cpCorner = Instance.new("UICorner")
+    cpCorner.CornerRadius = UDim.new(0, 12)
+    cpCorner.Parent = controlPanel
+
+    local cpPadding = Instance.new("UIPadding")
+    cpPadding.PaddingTop = UDim.new(0, 10)
+    cpPadding.PaddingBottom = UDim.new(0, 12)
+    cpPadding.PaddingLeft = UDim.new(0, 10)
+    cpPadding.PaddingRight = UDim.new(0, 10)
+    cpPadding.Parent = controlPanel
+
+    local cpLayout = Instance.new("UIListLayout")
+    cpLayout.Padding = UDim.new(0, 8)
+    cpLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    cpLayout.Parent = controlPanel
+
+    local cpHeader = Instance.new("Frame")
+    cpHeader.Size = UDim2.new(1, 0, 0, 30)
+    cpHeader.BackgroundTransparency = 1
+    cpHeader.LayoutOrder = 0
+    cpHeader.Parent = controlPanel
+
+    local focusName = Instance.new("TextLabel")
+    focusName.Name = "FocusName"
+    focusName.Size = UDim2.new(1, -80, 1, 0)
+    focusName.BackgroundTransparency = 1
+    focusName.Text = "No cart focused"
+    focusName.TextColor3 = Color3.fromRGB(240, 240, 240)
+    focusName.Font = Enum.Font.GothamBold
+    focusName.TextSize = 14
+    focusName.TextXAlignment = Enum.TextXAlignment.Left
+    focusName.Parent = cpHeader
+
+    local unfocusBtn = Instance.new("TextButton")
+    unfocusBtn.Name = "Unfocus"
+    unfocusBtn.Size = UDim2.new(0, 70, 0, 28)
+    unfocusBtn.Position = UDim2.new(1, -70, 0, 1)
+    unfocusBtn.Text = "UNFOCUS"
+    unfocusBtn.TextSize = 11
+    styleButton(unfocusBtn, CONFIG.DangerColor)
+    unfocusBtn.Parent = cpHeader
+
+    unfocusBtn.MouseButton1Click:Connect(function()
+        unfocusCart()
+    end)
+
+    -- Viewer
+    local viewerFrame = Instance.new("ViewportFrame")
+    viewerFrame.Name = "ViewerFrame"
+    viewerFrame.Size = UDim2.new(0, CONFIG.ViewerSize, 0, CONFIG.ViewerSize)
+    viewerFrame.Position = UDim2.new(0.5, -CONFIG.ViewerSize / 2, 0, 0)
+    viewerFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    viewerFrame.BackgroundTransparency = 0.2
+    viewerFrame.BorderSizePixel = 0
+    viewerFrame.LayoutOrder = 1
+    viewerFrame.Parent = controlPanel
+
+    local viewerCorner = Instance.new("UICorner")
+    viewerCorner.CornerRadius = UDim.new(0, 12)
+    viewerCorner.Parent = viewerFrame
+
+    local viewerStroke = Instance.new("UIStroke")
+    viewerStroke.Color = CONFIG.AccentColor
+    viewerStroke.Transparency = 0.5
+    viewerStroke.Thickness = 1
+    viewerStroke.Parent = viewerFrame
+
+    local viewerCamera = Instance.new("Camera")
+    viewerCamera.FieldOfView = 50
+    viewerFrame.CurrentCamera = viewerCamera
+
+    local buttonGrid = Instance.new("Frame")
+    buttonGrid.Name = "ButtonGrid"
+    buttonGrid.Size = UDim2.new(1, 0, 0, 0)
+    buttonGrid.AutomaticSize = Enum.AutomaticSize.Y
+    buttonGrid.BackgroundTransparency = 1
+    buttonGrid.LayoutOrder = 2
+    buttonGrid.Parent = controlPanel
+
+    local gridLayout = Instance.new("UIGridLayout")
+    gridLayout.CellSize = UDim2.new(0.5, -5, 0, CONFIG.ButtonHeight)
+    gridLayout.CellPadding = UDim2.new(0, 8, 0, 8)
+    gridLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    gridLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    gridLayout.Parent = buttonGrid
+
+    local function makeControlButton(name, accent, layoutOrder)
+        local btn = Instance.new("TextButton")
+        btn.Name = name
+        btn.Text = name
+        btn.LayoutOrder = layoutOrder
+        styleButton(btn, accent)
+        btn.Parent = buttonGrid
+        return btn
+    end
+
+    local lockBtn = makeControlButton("LOCK", CONFIG.LockActiveColor, 1)
+    local startBtn = makeControlButton("START/STOP", CONFIG.AccentColor, 2)
+    local upBtn = makeControlButton("UP", CONFIG.AccentColor, 3)
+    local downBtn = makeControlButton("DOWN", CONFIG.AccentColor, 4)
+    local spamUpBtn = makeControlButton("SPAM UP", CONFIG.SuccessColor, 5)
+    local spamDownBtn = makeControlButton("SPAM DOWN", CONFIG.SuccessColor, 6)
+
+    -- Dragging
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            Dragging = true
+            DragStartPos = Vector2.new(input.Position.X, input.Position.Y)
+            FrameStartPos = mainFrame.AbsolutePosition
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if Dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = Vector2.new(input.Position.X, input.Position.Y) - DragStartPos
+            local newTopLeft = FrameStartPos + delta
+            local size = mainFrame.AbsoluteSize
+            local anchor = mainFrame.AnchorPoint
+            mainFrame.Position = UDim2.new(0, newTopLeft.X + size.X * anchor.X, 0, newTopLeft.Y + size.Y * anchor.Y)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            Dragging = false
+        end
+    end)
+
+    Gui.ScreenGui = screenGui
+    Gui.MainFrame = mainFrame
+    Gui.ContentFrame = contentFrame
+    Gui.StatusLabel = statusLabel
+    Gui.PulseDot = pulseDot
+    Gui.CartsPage = cartsPage
+    Gui.ControlPanel = controlPanel
+    Gui.FocusName = focusName
+    Gui.ViewerFrame = viewerFrame
+    Gui.ViewerCamera = viewerCamera
+    Gui.LockBtn = lockBtn
+    Gui.StartBtn = startBtn
+    Gui.UpBtn = upBtn
+    Gui.DownBtn = downBtn
+    Gui.SpamUpBtn = spamUpBtn
+    Gui.SpamDownBtn = spamDownBtn
+    Gui.MinimizeBtn = minimizeBtn
+    Gui.SelectBtn = selectBtn
+end
+
+function toggleGuiExpanded()
+    IsExpanded = not IsExpanded
+    local mainFrame = Gui.MainFrame
+    local contentFrame = Gui.ContentFrame
+    local minimizeBtn = Gui.MinimizeBtn
+
+    if IsExpanded then
+        contentFrame.Visible = true
+        playTween(mainFrame, {Size = UDim2.new(0, CONFIG.GuiSize.X, 0, CONFIG.GuiSize.Y)}, 0.2)
+        minimizeBtn.Text = "−"
+    else
+        playTween(mainFrame, {Size = UDim2.new(0, CONFIG.GuiSize.X, 0, CONFIG.TitleBarHeight)}, 0.2)
+        task.delay(0.2, function()
+            if not IsExpanded then
+                contentFrame.Visible = false
+            end
+        end)
+        minimizeBtn.Text = "+"
+    end
+end
+
+-- Button wiring
+function wireControlButtons()
+    local function hasFocus()
+        return FocusedCart ~= nil or AllCartsMode
+    end
+
+    Gui.LockBtn.MouseButton1Click:Connect(function()
+        if not hasFocus() then return end
+
+        if AllCartsMode then
+            AllCartsLockActive = not AllCartsLockActive
+            for _, info in pairs(Registry) do
+                if info.LockActive ~= AllCartsLockActive then
+                    toggleLock(info, AllCartsLockActive)
+                end
+            end
+        else
+            toggleLock(FocusedCart)
+        end
+        updateLockButtonVisual()
+    end)
+
+    Gui.UpBtn.MouseButton1Click:Connect(function()
+        if not hasFocus() then return end
+        if AllCartsMode then
+            pressButtonOnAll("Up")
+        else
+            guiPressButton(FocusedCart, "Up")
+        end
+    end)
+
+    Gui.DownBtn.MouseButton1Click:Connect(function()
+        if not hasFocus() then return end
+        if AllCartsMode then
+            pressButtonOnAll("Down")
+        else
+            guiPressButton(FocusedCart, "Down")
+        end
+    end)
+
+    Gui.StartBtn.MouseButton1Click:Connect(function()
+        if not hasFocus() then return end
+        if AllCartsMode then
+            pressButtonOnAll("Toggle")
+        else
+            guiPressButton(FocusedCart, "Toggle")
+        end
+    end)
+
+    Gui.SpamUpBtn.MouseButton1Click:Connect(function()
+        if not hasFocus() then return end
+        SpamUpActive = not SpamUpActive
+        if SpamUpActive then
+            playTween(Gui.SpamUpBtn, {BackgroundColor3 = CONFIG.SuccessColor:Lerp(Color3.new(1,1,1), 0.3)}, 0.1)
+            task.spawn(function()
+                while SpamUpActive do
+                    if AllCartsMode then
+                        pressButtonOnAll("Up")
+                    elseif FocusedCart then
+                        guiPressButton(FocusedCart, "Up")
+                    end
+                    task.wait()
+                end
+            end)
+        else
+            playTween(Gui.SpamUpBtn, {BackgroundColor3 = CONFIG.SuccessColor}, 0.1)
+        end
+    end)
+
+    Gui.SpamDownBtn.MouseButton1Click:Connect(function()
+        if not hasFocus() then return end
+        SpamDownActive = not SpamDownActive
+        if SpamDownActive then
+            playTween(Gui.SpamDownBtn, {BackgroundColor3 = CONFIG.SuccessColor:Lerp(Color3.new(1,1,1), 0.3)}, 0.1)
+            task.spawn(function()
+                while SpamDownActive do
+                    if AllCartsMode then
+                        pressButtonOnAll("Down")
+                    elseif FocusedCart then
+                        guiPressButton(FocusedCart, "Down")
+                    end
+                    task.wait()
+                end
+            end)
+        else
+            playTween(Gui.SpamDownBtn, {BackgroundColor3 = CONFIG.SuccessColor}, 0.1)
+        end
+    end)
+end
+
+-- Main loops
+function startLoops()
+    task.spawn(function()
+        while true do
+            scanWorkspace()
+            task.wait(CONFIG.RegistryScanInterval)
+        end
+    end)
+
+    task.spawn(function()
+        while true do
+            refreshCartList()
+            for _, info in pairs(Registry) do
+                if EspEnabled then
+                    local isRiding, riderName = getCartRiderInfo(info)
+                    if isRiding then
+                        setEspRidden(info, riderName)
+                    else
+                        setEspIdle(info)
+                    end
+                end
+            end
+            task.wait(CONFIG.RefreshInterval)
+        end
+    end)
+
+    RunService.RenderStepped:Connect(function()
+        checkFocusedCart()
+
+        if FocusedCart and FocusedCart.ViewerClone then
+            local clone = FocusedCart.ViewerClone
+            local angle = tick() * CONFIG.OrbitSpeed
+            local extents = clone:GetExtentsSize()
+            local maxDim = math.max(extents.X, extents.Y, extents.Z)
+            local radius = math.max(maxDim * 1.9, 5)
+            local cam = Gui.ViewerCamera
+            cam.CFrame = CFrame.lookAt(Vector3.new(math.cos(angle) * radius, radius * 0.35, math.sin(angle) * radius), Vector3.new(0, 0, 0))
+        end
+    end)
+
+    -- Per-frame lock guards
+    RunService.Heartbeat:Connect(function()
+        for _, info in pairs(Registry) do
+            if info.LockActive then
+                -- Toggle (Start/On) red-state guard
+                local toggleCd = info.Buttons.Toggle
+                if toggleCd and info.LockedToggleRed ~= nil then
+                    local part = toggleCd.Parent
+                    if part and part:IsA("BasePart") then
+                        local nowRed = isRedColor(part.Color)
+                        if info.ToggleArmed then
+                            if nowRed ~= info.LockedToggleRed then
+                                if tick() > (info.Guard[toggleCd] or 0) and tick() > (info.LastCounter["Toggle"] or 0) then
+                                    info.LastCounter["Toggle"] = tick() + CONFIG.LockCounterDebounce
+                                    guiPressButton(info, "Toggle")
+                                end
+                                info.ToggleArmed = false
+                            end
+                        else
+                            if nowRed == info.LockedToggleRed then
+                                info.ToggleArmed = true
+                            end
+                        end
+                    end
+                end
+
+                -- Speed-based Up/Down guard
+                if info.LockedSpeed ~= nil then
+                    local current = getCartSpeed(info)
+                    if current ~= nil then
+                        local diff = current - info.LockedSpeed
+                        if math.abs(diff) > 0.5 then
+                            local upCd = info.Buttons.Up
+                            local downCd = info.Buttons.Down
+                            if diff < 0 and upCd and tick() > (info.Guard[upCd] or 0) and tick() > (info.LastCounter["Up"] or 0) then
+                                info.LastCounter["Up"] = tick() + CONFIG.LockCounterDebounce
+                                guiPressButton(info, "Up")
+                            elseif diff > 0 and downCd and tick() > (info.Guard[downCd] or 0) and tick() > (info.LastCounter["Down"] or 0) then
+                                info.LastCounter["Down"] = tick() + CONFIG.LockCounterDebounce
+                                guiPressButton(info, "Down")
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode == CONFIG.ToggleKey then
+            IsOpen = not IsOpen
+            Gui.MainFrame.Visible = IsOpen
+        end
+        if SelectingCart and (input.UserInputType == Enum.UserInputType.MouseButton2 or input.KeyCode == Enum.KeyCode.Escape) then
+            stopCartSelection()
+        end
+    end)
+end
+
+-- Descendant events
+table.insert(Connections, Workspace.DescendantAdded:Connect(function(instance)
+    if not instance:IsA("BasePart") then return end
+    task.defer(function()
+        local role = getButtonName(instance)
+        if role and findClickDetector(instance) then
+            local model = getTopModel(instance)
+            if model then
+                registerCart(model)
+            end
+        end
+        if instance:IsA("Seat") or instance:IsA("VehicleSeat") then
+            local model = getTopModel(instance)
+            if model and Registry[model] then
+                scanModelForParts(Registry[model])
+            end
+        end
+    end)
+end))
+
+table.insert(Connections, Workspace.DescendantRemoving:Connect(function(instance)
+    local model = nil
+    if instance:IsA("Model") then
+        model = instance
+    elseif instance:IsA("BasePart") then
+        model = getTopModel(instance)
+    end
+    if model and Registry[model] and not isInWorkspace(model) then
+        unregisterCart(model)
+    end
+end))
+
+-- Init
+buildGui()
+wireControlButtons()
+scanWorkspace()
+refreshCartList()
+startLoops()
+
+print("[Cart Hub] Loaded.")
