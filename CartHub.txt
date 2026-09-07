@@ -1,3 +1,9 @@
+--[[
+    Cart Hub
+    Executor loadstring:
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/b-risk/CartHub/refs/heads/main/CartHub.txt"))()
+--]]
+
 local CONFIG = {
     ToggleKey = Enum.KeyCode.RightShift,
 
@@ -552,13 +558,15 @@ end
 function fireButton(cd)
     if not cd then return end
 
+    -- v1-style direct fireclickdetector (works with most executors)
     if typeof(fireclickdetector) == "function" then
         pcall(function()
-            fireclickdetector(cd, 0, "MouseClick")
+            fireclickdetector(cd)
         end)
         return
     end
 
+    -- Fallback for non-exploit environments
     pcall(function()
         local original = cd.MaxActivationDistance
         cd.MaxActivationDistance = 10000
@@ -593,6 +601,30 @@ function updateLockButtonVisual()
     end
 end
 
+function enforceToggleLock(cartInfo)
+    if not cartInfo.LockActive then return end
+    local toggleCd = cartInfo.Buttons.Toggle
+    if not toggleCd or cartInfo.LockedToggleRed == nil then return end
+
+    local part = toggleCd.Parent
+    if not part or not part:IsA("BasePart") then return end
+
+    local nowRed = isRedColor(part.Color)
+    if cartInfo.ToggleArmed then
+        if nowRed ~= cartInfo.LockedToggleRed then
+            if tick() > (cartInfo.Guard[toggleCd] or 0) and tick() > (cartInfo.LastCounter["Toggle"] or 0) then
+                cartInfo.LastCounter["Toggle"] = tick() + CONFIG.LockCounterDebounce
+                guiPressButton(cartInfo, "Toggle")
+            end
+            cartInfo.ToggleArmed = false
+        end
+    else
+        if nowRed == cartInfo.LockedToggleRed then
+            cartInfo.ToggleArmed = true
+        end
+    end
+end
+
 function toggleLock(cartInfo, forceState)
     local newState = forceState ~= nil and forceState or not cartInfo.LockActive
     cartInfo.LockActive = newState
@@ -609,6 +641,11 @@ function toggleLock(cartInfo, forceState)
             if togglePart and togglePart:IsA("BasePart") then
                 cartInfo.LockedToggleRed = isRedColor(togglePart.Color)
                 cartInfo.ToggleArmed = true
+
+                -- v1-style immediate event enforcement, backed up by the frame loop
+                table.insert(cartInfo.ButtonConnections, togglePart.Changed:Connect(function()
+                    enforceToggleLock(cartInfo)
+                end))
             end
         end
 
@@ -1739,27 +1776,8 @@ function startLoops()
     RunService.Heartbeat:Connect(function()
         for _, info in pairs(Registry) do
             if info.LockActive then
-                -- Toggle (Start/On) red-state guard
-                local toggleCd = info.Buttons.Toggle
-                if toggleCd and info.LockedToggleRed ~= nil then
-                    local part = toggleCd.Parent
-                    if part and part:IsA("BasePart") then
-                        local nowRed = isRedColor(part.Color)
-                        if info.ToggleArmed then
-                            if nowRed ~= info.LockedToggleRed then
-                                if tick() > (info.Guard[toggleCd] or 0) and tick() > (info.LastCounter["Toggle"] or 0) then
-                                    info.LastCounter["Toggle"] = tick() + CONFIG.LockCounterDebounce
-                                    guiPressButton(info, "Toggle")
-                                end
-                                info.ToggleArmed = false
-                            end
-                        else
-                            if nowRed == info.LockedToggleRed then
-                                info.ToggleArmed = true
-                            end
-                        end
-                    end
-                end
+                -- Toggle (Start/On) red-state guard (also enforced by .Changed event)
+                enforceToggleLock(info)
 
                 -- Speed-based Up/Down guard
                 if info.LockedSpeed ~= nil then
