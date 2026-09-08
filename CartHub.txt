@@ -14,6 +14,7 @@ local CONFIG = {
     LockActiveColor = Color3.fromRGB(255, 60, 60),
     DangerColor = Color3.fromRGB(255, 80, 80),
     SuccessColor = Color3.fromRGB(80, 255, 140),
+    InactiveButtonColor = Color3.fromRGB(45, 45, 52),
 
     GuiSize = Vector2.new(420, 580),
     TitleBarHeight = 40,
@@ -712,14 +713,28 @@ function stopAllSpam()
     SpamUpActive = false
     SpamDownActive = false
     if Gui.SpamUpBtn then
-        Gui.SpamUpBtn.BackgroundColor3 = CONFIG.SuccessColor
+        Gui.SpamUpBtn.BackgroundColor3 = CONFIG.InactiveButtonColor
     end
     if Gui.SpamDownBtn then
-        Gui.SpamDownBtn.BackgroundColor3 = CONFIG.SuccessColor
+        Gui.SpamDownBtn.BackgroundColor3 = CONFIG.InactiveButtonColor
     end
 end
 
 -- Focus / spectate
+function updateSpeedDisplay()
+    if not Gui.SpeedLabel then return end
+    if FocusedCart then
+        local speed = getCartSpeed(FocusedCart)
+        if speed ~= nil then
+            Gui.SpeedLabel.Text = string.format("%.1f", speed)
+        else
+            Gui.SpeedLabel.Text = "--"
+        end
+    else
+        Gui.SpeedLabel.Text = "--"
+    end
+end
+
 function focusCart(cartInfo)
     if FocusedCart == cartInfo and not AllCartsMode then return end
     if not isInWorkspace(cartInfo.Model) then return end
@@ -732,6 +747,7 @@ function focusCart(cartInfo)
     Gui.FocusName.Text = "Spectating: " .. cartInfo.Model.Name
     Gui.ControlPanel.Visible = true
     Gui.ViewerFrame.Visible = true
+    updateSpeedDisplay()
 
     local primary = cartInfo.PrimaryPart
     if primary then
@@ -754,6 +770,7 @@ function focusAllCarts()
     Gui.FocusName.Text = "Controlling: ALL CARTS"
     Gui.ControlPanel.Visible = true
     Gui.ViewerFrame.Visible = false
+    updateSpeedDisplay()
 
     local humanoid = getHumanoid()
     if humanoid then
@@ -806,6 +823,7 @@ function unfocusCart()
     Gui.FocusName.Text = "No cart focused"
     Gui.ControlPanel.Visible = false
     Gui.ViewerFrame.Visible = true
+    updateSpeedDisplay()
 
     updateLockButtonVisual()
     refreshCartList()
@@ -1178,6 +1196,10 @@ function refreshCartList()
     end
 
     table.sort(list, function(a, b)
+        -- Pin the focused cart so it never jumps around
+        if a == FocusedCart then return true end
+        if b == FocusedCart then return false end
+
         local aRiding, aRider = getCartRiderInfo(a)
         local bRiding, bRider = getCartRiderInfo(b)
         if aRiding and not bRiding then return true end
@@ -1208,12 +1230,12 @@ function refreshCartList()
     if FocusedCart then
         local speed = getCartSpeed(FocusedCart)
         if speed ~= nil then
-            Gui.SpeedLabel.Text = string.format("Speed: %.1f", speed)
+            Gui.SpeedLabel.Text = string.format("%.1f", speed)
         else
-            Gui.SpeedLabel.Text = "Speed: --"
+            Gui.SpeedLabel.Text = "--"
         end
     else
-        Gui.SpeedLabel.Text = "Speed: --"
+        Gui.SpeedLabel.Text = "--"
     end
 end
 
@@ -1389,7 +1411,7 @@ function buildGui()
 
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Name = "StatusLabel"
-    statusLabel.Size = UDim2.new(0.55, 0, 1, 0)
+    statusLabel.Size = UDim2.new(1, -50, 1, 0)
     statusLabel.Position = UDim2.new(0, 40, 0, 0)
     statusLabel.BackgroundTransparency = 1
     statusLabel.Text = "Carts: 0   •   Riding: 0"
@@ -1398,18 +1420,6 @@ function buildGui()
     statusLabel.TextSize = 14
     statusLabel.TextXAlignment = Enum.TextXAlignment.Left
     statusLabel.Parent = statusCard
-
-    local speedLabel = Instance.new("TextLabel")
-    speedLabel.Name = "SpeedLabel"
-    speedLabel.Size = UDim2.new(0.4, -10, 1, 0)
-    speedLabel.Position = UDim2.new(0.6, 0, 0, 0)
-    speedLabel.BackgroundTransparency = 1
-    speedLabel.Text = "Speed: --"
-    speedLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-    speedLabel.Font = Enum.Font.Gotham
-    speedLabel.TextSize = 13
-    speedLabel.TextXAlignment = Enum.TextXAlignment.Right
-    speedLabel.Parent = statusCard
 
     local pulseDot = Instance.new("Frame")
     pulseDot.Name = "PulseDot"
@@ -1496,7 +1506,7 @@ function buildGui()
 
     local focusName = Instance.new("TextLabel")
     focusName.Name = "FocusName"
-    focusName.Size = UDim2.new(1, -80, 1, 0)
+    focusName.Size = UDim2.new(1, -160, 1, 0)
     focusName.BackgroundTransparency = 1
     focusName.Text = "No cart focused"
     focusName.TextColor3 = Color3.fromRGB(240, 240, 240)
@@ -1504,6 +1514,41 @@ function buildGui()
     focusName.TextSize = 14
     focusName.TextXAlignment = Enum.TextXAlignment.Left
     focusName.Parent = cpHeader
+
+    -- Speed chip (focused cart only)
+    local speedChip = Instance.new("Frame")
+    speedChip.Name = "SpeedChip"
+    speedChip.Size = UDim2.new(0, 70, 0, 24)
+    speedChip.Position = UDim2.new(1, -146, 0, 3)
+    speedChip.BackgroundColor3 = Color3.fromRGB(36, 36, 42)
+    speedChip.BorderSizePixel = 0
+    speedChip.Parent = cpHeader
+
+    local speedChipCorner = Instance.new("UICorner")
+    speedChipCorner.CornerRadius = UDim.new(0, 6)
+    speedChipCorner.Parent = speedChip
+
+    local speedStrip = Instance.new("Frame")
+    speedStrip.Size = UDim2.new(0, 3, 0.6, 0)
+    speedStrip.Position = UDim2.new(0, 6, 0.2, 0)
+    speedStrip.BackgroundColor3 = CONFIG.AccentColor
+    speedStrip.BorderSizePixel = 0
+    speedStrip.Parent = speedChip
+    local speedStripCorner = Instance.new("UICorner")
+    speedStripCorner.CornerRadius = UDim.new(1, 0)
+    speedStripCorner.Parent = speedStrip
+
+    local speedLabel = Instance.new("TextLabel")
+    speedLabel.Name = "SpeedLabel"
+    speedLabel.Size = UDim2.new(1, -16, 1, 0)
+    speedLabel.Position = UDim2.new(0, 16, 0, 0)
+    speedLabel.BackgroundTransparency = 1
+    speedLabel.Text = "--"
+    speedLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    speedLabel.Font = Enum.Font.GothamBold
+    speedLabel.TextSize = 12
+    speedLabel.TextXAlignment = Enum.TextXAlignment.Center
+    speedLabel.Parent = speedChip
 
     local unfocusBtn = Instance.new("TextButton")
     unfocusBtn.Name = "Unfocus"
@@ -1572,8 +1617,8 @@ function buildGui()
     local startBtn = makeControlButton("START/STOP", CONFIG.AccentColor, 2)
     local upBtn = makeControlButton("UP", CONFIG.AccentColor, 3)
     local downBtn = makeControlButton("DOWN", CONFIG.AccentColor, 4)
-    local spamUpBtn = makeControlButton("SPAM UP", CONFIG.SuccessColor, 5)
-    local spamDownBtn = makeControlButton("SPAM DOWN", CONFIG.SuccessColor, 6)
+    local spamUpBtn = makeControlButton("SPAM UP", CONFIG.InactiveButtonColor, 5)
+    local spamDownBtn = makeControlButton("SPAM DOWN", CONFIG.InactiveButtonColor, 6)
 
     -- Dragging
     titleBar.InputBegan:Connect(function(input)
@@ -1707,7 +1752,7 @@ function wireControlButtons()
                 end
             end)
         else
-            playTween(Gui.SpamUpBtn, {BackgroundColor3 = CONFIG.SuccessColor}, 0.1)
+            playTween(Gui.SpamUpBtn, {BackgroundColor3 = CONFIG.InactiveButtonColor}, 0.1)
         end
     end)
 
@@ -1727,7 +1772,7 @@ function wireControlButtons()
                 end
             end)
         else
-            playTween(Gui.SpamDownBtn, {BackgroundColor3 = CONFIG.SuccessColor}, 0.1)
+            playTween(Gui.SpamDownBtn, {BackgroundColor3 = CONFIG.InactiveButtonColor}, 0.1)
         end
     end)
 end
